@@ -2,9 +2,8 @@
 # Weekly Sentiment Scraper (Finviz-based) — Clean version (Pct_EOD removed)
 # ---------------------------------------------------------------------------------
 # Notes:
-#   • Computes Pct_1h, Pct_4h, Pct_EOW only.
-#   • Summary no longer aggregates Avg_EOD_Change.
-#   • Everything else remains drop-in compatible.
+#   • Computes Pct_1h, Pct_4h, Pct_EOW.
+#   • Everything remains drop-in compatible.
 #
 # Requirements: finviz.csv (Ticker column), yfinance, aiohttp, bs4, nltk (vader_lexicon), pytz, python-dotenv
 
@@ -307,3 +306,4 @@ if __name__ == "__main__":
             print("ℹ️ Email variables not set; skipped email.")
     else:
         print("⚠️ No valid headlines or price data to export.")
+
