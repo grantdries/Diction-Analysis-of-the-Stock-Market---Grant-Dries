@@ -1,0 +1,330 @@
+# ---------------------------------------------------------------------------------
+# add_predictions.py — Clean version (will NOT recreate Pct_EOD if missing)
+# ---------------------------------------------------------------------------------
+# • Works with a workbook that has sheets: Headlines, Summary
+# • Accepts absence of Pct_EOD and trains on Pct_EOW (or falls back)
+# • Removes any auto-recompute of Pct_EOD (both in repair and soft-rename sections)
+
+import pandas as pd, numpy as np
+from pathlib import Path
+import datetime as dt
+
+# -----------------------------
+# Config
+# -----------------------------
+CANDIDATES = [
+    "weekly_sentiment_report.xlsx",
+    "weekly_sentiment_with_predictions.xlsx",
+    "weekly_sentiment_with_predictions_v2.xlsx",
+]
+OUTPUT_XLSX = "weekly_sentiment_with_predictions_v4.xlsx"
+ONLY_MARKET_HOURS = False
+RIDGE_ALPHA = 1e-3
+INTRADAY_REPAIR_DAYS = 8
+
+# -----------------------------
+# Utilities
+# -----------------------------
+def _to_num(x):
+    try: return float(x)
+    except: return np.nan
+
+def _pct(a, b):
+    try:
+        a = float(a); b = float(b)
+        if not np.isfinite(a) or not np.isfinite(b) or a == 0: return np.nan
+        return (b - a) / a * 100.0
+    except: return np.nan
+
+def wavg(values, weights):
+    v = np.asarray(values, float); w = np.asarray(weights, float)
+    m = np.isfinite(v) & np.isfinite(w) & (w > 0)
+    return np.average(v[m], weights=w[m]) if m.any() else np.nan
+
+# -----------------------------
+# Locate workbook
+# -----------------------------
+cwd = Path.cwd()
+inp = None
+for name in CANDIDATES:
+    p = cwd / name
+    if p.exists():
+        inp = p; break
+if not inp:
+    raise FileNotFoundError(f"Could not find any of {CANDIDATES} in {cwd}")
+
+print(f"📄 Using input: {inp.name}")
+xls = pd.ExcelFile(inp)
+if "Headlines" not in xls.sheet_names or "Summary" not in xls.sheet_names:
+    raise ValueError("Workbook must include 'Headlines' and 'Summary' sheets.")
+
+df = xls.parse("Headlines")
+summary_df = xls.parse("Summary")
+
+# -----------------------------
+# Intraday repair (Option 1)
+# Re-compute Price@Time, +1h, +4h, EndOfDay using 5m bars for recent rows,
+# then rebuild Pct_* columns — EXCEPT Pct_EOD (intentionally skipped).
+# -----------------------------
+def repair_intraday(df, days=INTRADAY_REPAIR_DAYS):
+    import yfinance as yf, pytz
+    if "Datetime" not in df.columns:
+        return df
+    df = df.copy()
+    if not np.issubdtype(df["Datetime"].dtype, np.datetime64):
+        df["Datetime"] = pd.to_datetime(df["Datetime"], errors="coerce")
+    eastern = pytz.timezone("US/Eastern")
+    dt_utcnow = dt.datetime.utcnow().replace(tzinfo=pytz.UTC)
+
+    pct_eow = pd.to_numeric(df.get("Pct_EOW", pd.Series([np.nan]*len(df))), errors="coerce")
+    is_bad = pct_eow.isna() | (pct_eow.abs() < 1e-12)
+
+    dt_series = pd.to_datetime(df["Datetime"], errors="coerce")
+    dt_et = dt_series.apply(lambda x: eastern.localize(x) if (pd.notna(x) and x.tzinfo is None) else x)
+    recent = (dt_utcnow - dt_et.dt.tz_convert("UTC")) <= pd.Timedelta(days=days)
+    mask = is_bad & recent.fillna(False)
+
+    if not mask.any():
+        print("ℹ️ Intraday repair: no recent rows needing repair.")
+        return df
+
+    price_now_col = "Price @ Time"
+    p1h_col = "+1h Price"
+    p4h_col = "+4h Price"
+    eod_col = "End of Day Price"
+    eow_col = "End of Week Price"
+
+    cache_5m = {}
+    cache_daily = {}
+
+    def _tz_convert(idx):
+        if idx.tz is None:
+            return idx.tz_localize("UTC").tz_convert(eastern)
+        return idx.tz_convert(eastern)
+
+    print(f"🔧 Intraday repair: fixing {int(mask.sum())} recent rows with 5m/daily bars...")
+    for tkr, g in df[mask].groupby("Ticker"):
+        try:
+            if tkr not in cache_5m:
+                cache_5m[tkr] = yf.Ticker(tkr).history(period=f"{days}d", interval="5m")
+            if tkr not in cache_daily:
+                cache_daily[tkr] = yf.Ticker(tkr).history(period="1mo", interval="1d")
+            hist5 = cache_5m[tkr]
+            daily = cache_daily[tkr]
+            if not hist5.empty:
+                hist5 = hist5.copy()
+                hist5.index = _tz_convert(hist5.index)
+            if not daily.empty:
+                daily = daily.copy()
+                daily.index = _tz_convert(daily.index)
+
+            for idx in g.index:
+                dtime = dt_et.iloc[idx]
+                if pd.isna(dtime):
+                    continue
+                if dtime.tzinfo is None:
+                    dtime = eastern.localize(dtime)
+                day_str = dtime.strftime("%Y-%m-%d")
+
+                price_now = plus_1h = plus_4h = eod_price = np.nan
+
+                # Try 5m bars
+                if not hist5.empty:
+                    same_day = hist5.loc[hist5.index.strftime("%Y-%m-%d") == day_str]
+                    if not same_day.empty:
+                        prior = same_day.loc[:dtime]
+                        if not prior.empty:
+                            price_now = float(prior["Close"].iloc[-1])
+                            pos_now = same_day.index.get_indexer([prior.index[-1]])[0]
+                            pos_1h = min(pos_now + 12, len(same_day) - 1)
+                            pos_4h = min(pos_now + 48, len(same_day) - 1)
+                            plus_1h = float(same_day["Close"].iloc[pos_1h])
+                            plus_4h = float(same_day["Close"].iloc[pos_4h])
+                        eod_price = float(same_day["Close"].iloc[-1])
+
+                # Fallback to daily if needed
+                if (pd.isna(price_now) or pd.isna(eod_price)) and not daily.empty:
+                    day_row = daily.loc[daily.index.strftime("%Y-%m-%d") == day_str]
+                    if not day_row.empty:
+                        open_ = float(day_row["Open"].iloc[0])
+                        close_ = float(day_row["Close"].iloc[0])
+                        if pd.isna(price_now):
+                            price_now = open_ if dtime.time() < dt.time(16, 0) else close_
+                        if pd.isna(eod_price):
+                            eod_price = close_
+
+                if not pd.isna(price_now): df.at[idx, price_now_col] = price_now
+                if not pd.isna(plus_1h):   df.at[idx, p1h_col]     = plus_1h
+                if not pd.isna(plus_4h):   df.at[idx, p4h_col]     = plus_4h
+                if not pd.isna(eod_price): df.at[idx, eod_col]     = eod_price
+        except Exception:
+            continue
+
+    # Recompute percent columns — skip Pct_EOD on purpose
+    if price_now_col in df.columns and p1h_col in df.columns:
+        df["Pct_1h"] = df.apply(lambda r: _pct(r[price_now_col], r[p1h_col]), axis=1)
+    if price_now_col in df.columns and p4h_col in df.columns:
+        df["Pct_4h"] = df.apply(lambda r: _pct(r[price_now_col], r[p4h_col]), axis=1)
+    if price_now_col in df.columns and eow_col in df.columns:
+        df["Pct_EOW"] = df.apply(lambda r: _pct(r[price_now_col], r[eow_col]), axis=1)
+
+    return df
+
+df = repair_intraday(df)
+
+# -----------------------------
+# Soft-rename price columns & rebuild Pct_* ONLY for 1h/4h/EOW
+# -----------------------------
+price_cols = {
+    "now": "Price @ Time",
+    "p1h": "+1h Price",
+    "p4h": "+4h Price",
+    "eod": "End of Day Price",
+    "eow": "End of Week Price",
+}
+for _, col in price_cols.items():
+    if col not in df.columns:
+        candidates = [c for c in df.columns if c.strip().lower() == col.strip().lower()]
+        if candidates:
+            df.rename(columns={candidates[0]: col}, inplace=True)
+
+if "Pct_1h" not in df.columns and all(c in df.columns for c in [price_cols["now"], price_cols["p1h"]]):
+    df["Pct_1h"] = df.apply(lambda r: _pct(r[price_cols["now"]], r[price_cols["p1h"]]), axis=1)
+if "Pct_4h" not in df.columns and all(c in df.columns for c in [price_cols["now"], price_cols["p4h"]]):
+    df["Pct_4h"] = df.apply(lambda r: _pct(r[price_cols["now"]], r[price_cols["p4h"]]), axis=1)
+# Intentionally DO NOT recompute Pct_EOD
+if "Pct_EOW" not in df.columns and all(c in df.columns for c in [price_cols["now"], price_cols["eow"]]):
+    df["Pct_EOW"] = df.apply(lambda r: _pct(r[price_cols["now"]], r[price_cols["eow"]]), axis=1)
+
+# -----------------------------
+# Types & flags
+# -----------------------------
+for c in ["Lookup Score","VADER Score","Pct_1h","Pct_4h","Pct_EOW"]:  # removed Pct_EOD from this list
+    if c in df.columns: df[c] = df[c].apply(_to_num)
+for c in ["Ambiguous","After Market Close","Weekend News"]:
+    if c not in df.columns: df[c] = 0
+    df[c] = df[c].astype(int)
+if "Datetime" in df.columns and not np.issubdtype(df["Datetime"].dtype, np.datetime64):
+    df["Datetime"] = pd.to_datetime(df["Datetime"], errors="coerce")
+
+# Optional training filter
+train_df = df.copy()
+if ONLY_MARKET_HOURS:
+    train_df = train_df[(train_df["Weekend News"] == 0) & (train_df["After Market Close"] == 0)]
+
+# -----------------------------
+# Pick target & prep features
+# -----------------------------
+def target_stats(series):
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if s.empty: return {"n":0, "nz":0, "std":0.0}
+    return {"n":len(s), "nz":int((s.abs()>1e-12).sum()), "std":float(np.nanstd(s))}
+
+targets = [t for t in ["Pct_EOW","Pct_EOD"] if t in train_df.columns]  # if Pct_EOD missing, we'll use Pct_EOW
+if not targets: raise ValueError("Missing Pct_EOW (or Pct_EOD); cannot train.")
+
+chosen = None
+for t in targets:
+    st = target_stats(train_df[t])
+    print(f"📊 {t}: n={st['n']} nonzero={st['nz']} std={st['std']:.4f}")
+    if st["nz"] >= 20 and st["std"] > 0.02:
+        chosen = t; break
+if not chosen:
+    chosen = max(targets, key=lambda t: target_stats(train_df[t])["std"])
+print(f"🎯 Target selected: {chosen}")
+
+FEATURES = ["Lookup Score","VADER Score","Pct_1h","Pct_4h","Ambiguous","After Market Close","Weekend News"]
+train = train_df.dropna(subset=[chosen]).copy()
+for c in FEATURES:
+    if c not in train.columns: train[c] = 0.0
+train[FEATURES] = train[FEATURES].fillna(0.0)
+train["SentSign"] = np.sign(train["Lookup Score"].fillna(0) + train["VADER Score"].fillna(0))
+train["SentMag"]  = np.abs(train["Lookup Score"].fillna(0)) + np.abs(train["VADER Score"].fillna(0))
+FEATS = FEATURES + ["SentSign","SentMag"]
+
+# -----------------------------
+# Fit Ridge OLS or fallback heuristic
+# -----------------------------
+used_model = False
+if len(train) >= 30 and np.nanstd(train[chosen].astype(float)) > 1e-6:
+    X = np.column_stack([np.ones(len(train))] + [train[c].values for c in FEATS])
+    y = train[chosen].values.astype(float)
+    XtX = X.T @ X + RIDGE_ALPHA * np.eye(X.shape[1])
+    beta = np.linalg.solve(XtX, X.T @ y)
+    print(f"⚙️  Fitted model; first 5 betas: {beta[:5].round(4)}")
+
+    full = df.copy()
+    for c in FEATS:
+        if c not in full.columns: full[c] = 0.0
+    full[FEATS] = full[FEATS].fillna(0.0)
+    X_all = np.column_stack([np.ones(len(full))] + [full[c].values for c in FEATS])
+    df["Pred_Article_%"] = X_all @ beta
+    used_model = True
+else:
+    base = pd.to_numeric(df.get(chosen), errors="coerce")
+    if not np.isfinite(base).any() or (np.nanstd(base) < 1e-9):
+        base = pd.to_numeric(df.get("Pct_4h", pd.Series(np.nan)), errors="coerce")
+        if not np.isfinite(base).any():
+            base = pd.Series(0.5, index=df.index)  # 0.5% fallback
+    med_abs = float(np.nanmedian(np.abs(base)))
+    sent_sign = np.sign(pd.to_numeric(df.get("Lookup Score"), errors="coerce").fillna(0) +
+                        pd.to_numeric(df.get("VADER Score"), errors="coerce").fillna(0))
+    df["Pred_Article_%"] = sent_sign.values * med_abs
+    print(f"🛟 Heuristic used; median |{chosen or 'Pct_4h'}| = {med_abs:.3f}%")
+
+# -----------------------------
+# Recency weighting & roll-up
+# -----------------------------
+if "Datetime" in df.columns and df["Datetime"].notna().any():
+    tmin = df["Datetime"].min(); tmax = df["Datetime"].max()
+    trange_days = max((tmax - tmin).days, 0) + 1
+    recency_w = 1.0 + (df["Datetime"] - tmin).dt.total_seconds() / (86400.0 * trange_days)
+else:
+    recency_w = pd.Series(1.0, index=df.index)
+df["_W"] = recency_w.fillna(1.0)
+
+preds = (df.groupby("Ticker")
+           .apply(lambda g: wavg(g["Pred_Article_%"], g["_W"]))
+           .rename("Pred_NextDay_%")
+           .reset_index())
+
+# -----------------------------
+# Merge + Predictions sheet
+# -----------------------------
+summary_out = summary_df.merge(preds, on="Ticker", how="left")
+
+latest = (df.sort_values("Datetime")
+            .groupby("Ticker")
+            .tail(1)[["Ticker","Datetime","Title","VADER Score","Lookup Score","Pred_Article_%"]]
+            .rename(columns={"Datetime":"Last_Headline_Time",
+                             "Title":"Last_Headline_Title",
+                             "VADER Score":"Last_VADER",
+                             "Lookup Score":"Last_Lookup",
+                             "Pred_Article_%":"Last_Headline_Pred_%"}))
+
+predictions_sheet = preds.merge(latest, on="Ticker", how="left")
+predictions_sheet.insert(1, "Method", "Ridge OLS" if used_model else f"Heuristic({chosen})")
+
+# -----------------------------
+# Diagnostics
+# -----------------------------
+def quick_stats(name, s):
+    s = pd.to_numeric(s, errors="coerce")
+    print(f"🔎 {name}: count={int(s.notna().sum())}, "
+          f"nonzero={int((s.fillna(0).abs()>1e-12).sum())}, "
+          f"min={np.nanmin(s):.3f}, med={np.nanmedian(s):.3f}, mean={np.nanmean(s):.3f}, max={np.nanmax(s):.3f}")
+
+quick_stats("Pred_Article_%", df.get("Pred_Article_%"))
+quick_stats("Pred_NextDay_%", preds.get("Pred_NextDay_%"))
+
+# -----------------------------
+# Write output
+# -----------------------------
+outp = cwd / OUTPUT_XLSX
+with pd.ExcelWriter(outp) as w:
+    df.to_excel(w, sheet_name="Headlines", index=False)
+    summary_out.to_excel(w, sheet_name="Summary", index=False)
+    predictions_sheet.to_excel(w, sheet_name="Predictions", index=False)
+
+print(f"✅ Wrote {outp.name}")
+print(f"   Method: {'Ridge OLS' if used_model else f'Heuristic({chosen})'}")
