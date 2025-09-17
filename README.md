@@ -102,4 +102,9 @@ Good .gitignore additions:
 __pycache__/
 *.pyc
 
+DEMO RECORDING
+https://psu.mediaspace.kaltura.com/media/Demo%20Recording%20-%20Grant%20Dries/1_hbfax97z
+TECHNICAL RECORDING
+https://psu.mediaspace.kaltura.com/media/Technical%20Recording%20-%20Grant%20Dries/1_giwpic8u
+
 ---
